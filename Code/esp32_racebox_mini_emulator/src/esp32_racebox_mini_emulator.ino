@@ -49,7 +49,6 @@ const String deviceName = rawDeviceName;
 
 const int OnboardledPin = 2;
 
-Adafruit_MPU6050 mpu;
 const unsigned long AccelSampleInterval = 10; // 10ms = 100Hz
 // --- Smoothing Configuration ---
 // alpha = 1.0: No filtering (raw data)
@@ -177,13 +176,63 @@ void resetGpsBaudRate() {
   GPS_Serial.end();
 }
 
+// --- Universal MPU Class ---
+class UniversalMPU {
+public:
+    Adafruit_MPU6050 mpu; // The actual library object
+
+    bool begin(uint8_t addr = 0x68) {
+        Wire.begin();
+        
+        // 1. Manual WHO_AM_I check
+        Wire.beginTransmission(addr);
+        Wire.write(0x75);
+        if (Wire.endTransmission() != 0) return false; // Device not found
+        
+        Wire.requestFrom(addr, (uint8_t)1);
+        uint8_t chipID = Wire.read();
+
+        Serial.print("🔍 Detected Chip ID: 0x");
+        Serial.println(chipID, HEX);
+
+        // 2. If it's a 6500 (0x70) or 9250 (0x71), we "trick" the library
+        // We do this by initializing it, but we handle the failure
+        if (chipID == 0x70 || chipID == 0x71) {
+            Serial.println("Found MPU6500/9250. Applying bypass...");
+            // We still call begin, but it might return false because of the ID check.
+            // So we ignore the return value and manually force the power settings.
+            mpu.begin(addr); 
+            
+            // Force wake up (Power Management 1 register 0x6B set to 0)
+            Wire.beginTransmission(addr);
+            Wire.write(0x6B);
+            Wire.write(0x00);
+            Wire.endTransmission();
+            return true;
+        }
+
+        // 3. If it's a standard 6050, just let the library do its thing
+        return mpu.begin(addr);
+    }
+
+    // Pass-through functions to keep your existing code working
+    void setAccelerometerRange(mpu6050_accel_range_t r) { mpu.setAccelerometerRange(r); }
+    void setGyroRange(mpu6050_gyro_range_t r) { mpu.setGyroRange(r); }
+    void setFilterBandwidth(mpu6050_bandwidth_t b) { mpu.setFilterBandwidth(b); }
+    void getEvent(sensors_event_t* a, sensors_event_t* g, sensors_event_t* t) { mpu.getEvent(a, g, t); }
+};
+
+UniversalMPU mpu; // Still named 'mpu' so your setup() code doesn't have to change
+
 void setup() {
   Serial.begin(115200);
   pinMode(OnboardledPin, OUTPUT);
   if (!mpu.begin()) {
-    Serial.println("❌ Failed to find MPU6050 chip");
+    Serial.println("❌ Failed to find MPU chip");
     while (1) delay(100);
   }
+  
+  Serial.println("✅ MPU Sensor Online!");
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
@@ -321,12 +370,20 @@ void setup() {
   pManufacturer->setValue("RaceBox");
   pDeviceInfo->start();
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(RACEBOX_SERVICE_UUID);
-  // Advertise Device Information Service to help official apps discover the device
-  pAdvertising->addServiceUUID("0000180a-0000-1000-8000-00805f9b34fb");
+  BLEAdvertisementData oAdvertisementData;
+  oAdvertisementData.setFlags(0x06); // General Discoverable / BR_EDR_NOT_SUPPORTED
+  oAdvertisementData.setCompleteServices(BLEUUID(RACEBOX_SERVICE_UUID));
+  pAdvertising->setAdvertisementData(oAdvertisementData);
+  BLEAdvertisementData oScanResponseData;
+  oScanResponseData.setName(deviceName.c_str());
+  oScanResponseData.setCompleteServices(BLEUUID("0000180a-0000-1000-8000-00805f9b34fb"));
+  pAdvertising->setScanResponseData(oScanResponseData);
   pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // Optimization for iOS
+  pAdvertising->setMaxPreferred(0x12);
+  
   BLEDevice::startAdvertising();
-  Serial.println("📡 BLE advertising started.");
+  Serial.println("📡 BLE advertising started with Scan Response.");
 
   lastGpsRateCheckTime = millis();
 }
