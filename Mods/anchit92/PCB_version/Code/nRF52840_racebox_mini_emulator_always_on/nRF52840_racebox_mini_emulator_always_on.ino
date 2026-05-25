@@ -855,8 +855,12 @@ void connect_callback(uint16_t conn_handle) {
   // Bumping TX power back to 0 dBm for a stable, high-range connection
   Bluefruit.setTxPower(0);
 
-  Bluefruit.Advertising.setInterval(32, 244);
-  Bluefruit.Connection(conn_handle)->requestMtuExchange(128);
+  Bluefruit.Connection(conn_handle)->requestPHY(); // try 2M, harmless if rejected
+  Bluefruit.Connection(conn_handle)->requestMtuExchange(247);
+  Bluefruit.Connection(conn_handle)->requestConnectionParameter(24, 0, 400); // 30ms, 4s sup timeout
+  delay(400);
+  uint16_t mtu = Bluefruit.Connection(conn_handle)->getMtu();
+  Serial.printf(">> Negotiated MTU = %u (need >= 91 to fit 88-byte notify)\n", mtu);
 }
 
 void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
@@ -977,7 +981,7 @@ void setupBLE() {
   Bluefruit.setName(DEVICE_NAME);
   Bluefruit.Periph.setConnectCallback(connect_callback);
   Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
-  Bluefruit.Periph.setConnInterval(6, 12);
+  Bluefruit.Periph.setConnInterval(12, 24);
 
   // Service Setup
   disService.begin();
@@ -997,7 +1001,11 @@ void setupBLE() {
   rbService.begin();
   rbTx.setProperties(CHR_PROPS_NOTIFY);
   rbTx.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  rbTx.setFixedLen(88);
+  rbTx.setMaxLen(244);
+  rbTx.setCccdWriteCallback([](uint16_t conn, BLECharacteristic* c, uint16_t value){
+    Serial.printf(">> CCCD write on rbTx: 0x%04X (notify %s)\n",
+      value, (value & 0x0001) ? "ENABLED" : "disabled");
+  });
   rbTx.begin();
 
   rbRx.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
