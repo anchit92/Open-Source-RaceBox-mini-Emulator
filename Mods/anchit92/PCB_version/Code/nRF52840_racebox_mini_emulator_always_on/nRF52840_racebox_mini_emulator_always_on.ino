@@ -1135,5 +1135,5 @@ void loop() {
   reportSystemStats();
   manageBatterySampling();
   updateLEDs(GPSFixType);
-  yield();
+  delay(1);
 }
