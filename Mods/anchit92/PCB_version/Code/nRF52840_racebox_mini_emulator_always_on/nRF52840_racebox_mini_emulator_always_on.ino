@@ -31,7 +31,7 @@
 #define ENABLE_DEEP_SLEEP false   // Usually false for standard RaceBox usage
 #define FAST_ADV_INTERVAL 160 // 100ms: Fast discovery for apps (160 * 0.625ms)
 #define ECO_ADV_INTERVAL                                                       \
-  4000 // 2500ms: Extremely low power (4000 * 0.625ms = 2.5s latency to connect)
+  2400 // 1500ms: Low power eco advertising (2400 * 0.625ms = 1.5s latency to connect)
 #define LOOP_SLEEP 2500 // 2500ms delay for the main loop iteration while idle
 #define SLEEP_WHILE_CHARGING                                                   \
   true // Allow Light Sleep even when plugged in /Set false to force high power
@@ -91,9 +91,14 @@ unsigned long lastGpsRateCheckTime = 0;
 unsigned int gpsUpdateCount = 0;
 unsigned int gnssUpdateCount = 0;
 
-// Filter/IMU State (Now using hardware filtering)
+// Filter/IMU State (Hardware LPF + inter-epoch averaging)
 float imu_ax = 0, imu_ay = 0, imu_az = 0;
 float imu_gx = 0, imu_gy = 0, imu_gz = 0;
+
+// IMU Accumulator for inter-epoch averaging (summed between GPS transmits)
+float imu_sum_ax = 0, imu_sum_ay = 0, imu_sum_az = 0;
+float imu_sum_gx = 0, imu_sum_gy = 0, imu_sum_gz = 0;
+uint16_t imu_sample_count = 0;
 
 // BLE Core Objects
 const uint8_t RACEBOX_SERVICE_UUID[] = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5,
@@ -338,7 +343,21 @@ void sendRaceboxPacket() {
     batPct |= 0x80;
   writeLittleEndian(payload, 67, batPct);
 
-  // Physical Sensors (Hardware Filtered)
+  // Compute averaged IMU values from all samples since last GPS epoch
+  if (imu_sample_count > 0) {
+    imu_ax = imu_sum_ax / imu_sample_count;
+    imu_ay = imu_sum_ay / imu_sample_count;
+    imu_az = imu_sum_az / imu_sample_count;
+    imu_gx = imu_sum_gx / imu_sample_count;
+    imu_gy = imu_sum_gy / imu_sample_count;
+    imu_gz = imu_sum_gz / imu_sample_count;
+  }
+  // Reset accumulators for next epoch
+  imu_sum_ax = imu_sum_ay = imu_sum_az = 0;
+  imu_sum_gx = imu_sum_gy = imu_sum_gz = 0;
+  imu_sample_count = 0;
+
+  // Physical Sensors (Hardware LPF + Inter-Epoch Averaged)
   writeLittleEndian(payload, 68, (int16_t)(imu_ax * 1000.0));
   writeLittleEndian(payload, 70, (int16_t)(imu_ay * 1000.0));
   writeLittleEndian(payload, 72, (int16_t)(imu_az * 1000.0));
@@ -389,24 +408,33 @@ void processGNSS() {
     myGNSS.checkUblox();
 }
 
-// IMU Sampling (Hardware filters handle smoothing)
+// IMU Sampling (Accumulate between GPS epochs for zero-latency averaging)
 void processIMU() {
   if (!imuEnabled)
     return;
 
-  imu_ax = IMU.readFloatAccelX();
-  imu_ay = IMU.readFloatAccelY();
-  imu_az = IMU.readFloatAccelZ();
-  imu_gx = IMU.readFloatGyroX();
-  imu_gy = IMU.readFloatGyroY();
-  imu_gz = IMU.readFloatGyroZ();
+  // Stall guard: if GPS has gone silent for >1s worth of samples, reset
+  // the accumulators to prevent float precision drift from unbounded summation.
+  if (imu_sample_count >= 500) {
+    imu_sum_ax = imu_sum_ay = imu_sum_az = 0;
+    imu_sum_gx = imu_sum_gy = imu_sum_gz = 0;
+    imu_sample_count = 0;
+  }
+
+  imu_sum_ax += IMU.readFloatAccelX();
+  imu_sum_ay += IMU.readFloatAccelY();
+  imu_sum_az += IMU.readFloatAccelZ();
+  imu_sum_gx += IMU.readFloatGyroX();
+  imu_sum_gy += IMU.readFloatGyroY();
+  imu_sum_gz += IMU.readFloatGyroZ();
+  imu_sample_count++;
 }
 
 // ============================================================================
-// --- 🔋 POWER & SYSTEM MANAGEMENT ---
+// --- POWER & SYSTEM MANAGEMENT ---
 // ============================================================================
 bool resetGpsBaudRate() {
-  Serial.println("🔍 Deep Scanning for GNSS activity...");
+  Serial.println("Deep Scanning for GNSS activity...");
   long bauds[] = {9600, 38400, 115200, 57600};
 
   for (int b = 0; b < 4; b++) {
@@ -438,7 +466,7 @@ bool resetGpsBaudRate() {
 
       // Try the library sync
       if (myGNSS.begin(Serial1)) {
-        Serial.println("✅ UBX Protocol Synced!");
+        Serial.println("UBX Protocol Synced!");
 
         if (bauds[b] != GPS_BAUD) {
           Serial.print("Elevating to ");
@@ -454,7 +482,7 @@ bool resetGpsBaudRate() {
         myGNSS.saveConfiguration();
         return true;
       } else {
-        Serial.println("❌ Bytes received, but u-blox library could not sync "
+        Serial.println("Bytes received, but u-blox library could not sync "
                        "(Check protocol/clones).");
       }
     } else {
@@ -464,14 +492,14 @@ bool resetGpsBaudRate() {
     Serial1.end();
   }
 
-  Serial.println("❌ GNSS not detected. Check VCC voltage or TX/RX wiring.");
+  Serial.println("GNSS not detected. Check VCC voltage or TX/RX wiring.");
   return false;
 }
 
 bool configureGPS() {
   if (!pendingConfig)
     return false;
-  Serial.println("⚙️ Syncing GPS Settings...");
+  Serial.println("Syncing GPS Settings...");
   Serial1.begin(GPS_BAUD);
 
   bool detected = false;
@@ -556,7 +584,7 @@ bool configureGPS() {
   myGNSS.setNavigationFrequency(MAX_NAVIGATION_RATE);
 
   pendingConfig = false;
-  Serial.println("✅ Configuration complete.");
+  Serial.println("Configuration complete.");
   return true;
 }
 
@@ -601,7 +629,7 @@ void enableGPS() {
   gpsEnabled = true;
   delay(100);
   if (!deviceConnected) {
-    setupAdvertising(0, FAST_ADV_INTERVAL);
+    setupAdvertising(4, FAST_ADV_INTERVAL);
   }
 }
 
@@ -628,8 +656,8 @@ void disableGPS() {
 void enableIMU() {
   if (imuEnabled)
     return;
-  IMU.settings.accelSampleRate = 1660; // 1.6kHz for hardware filtering
-  IMU.settings.gyroSampleRate = 1660;
+  IMU.settings.accelSampleRate = 416;  // 416Hz: ~16 samples per 25Hz GPS epoch
+  IMU.settings.gyroSampleRate = 416;   // Matched to accel for coherent averaging
   IMU.settings.accelRange = 8;
   IMU.settings.gyroRange = 500;
 
@@ -637,12 +665,14 @@ void enableIMU() {
     return;
 
   // --- HARDWARE FILTER CONFIGURATION ---
+  // At 416Hz ODR, LPF bandwidths are tighter than at 1660Hz, providing
+  // better noise rejection while still capturing braking/cornering transients.
   // Gyroscope: Enable LPF1 (Register 0x13, Bit 1)
   IMU.writeRegister(0x13, 0x02);
   // Gyroscope: Set LPF1 Bandwidth (Register 0x15, Bits 1:0 = 01)
   IMU.writeRegister(0x15, 0x01);
   // Accelerometer: Enable LPF2 (Register 0x17, Bit 0) and Set HPCF (Bits 6:5 =
-  // 01 for ODR/50)
+  // 01 for ODR/50 = 416/50 = ~8.3Hz cutoff)
   IMU.writeRegister(0x17, 0x21);
 
   imuEnabled = true;
@@ -714,7 +744,7 @@ void managePower() {
   if (!deviceConnected && gpsEnabled && SLEEP_WHILE_CHARGING) {
     if (millis() - lastDisconnectTime > GPS_HOT_TIMEOUT_MS) {
       Serial.printf(
-          "⏰ GPS Hot Timeout Reached. Rebooting to clear hardware state...\n");
+          "GPS Hot Timeout Reached. Rebooting to clear hardware state...\n");
       Serial.flush();
       delay(10);
 
@@ -780,7 +810,7 @@ void reportSystemStats() {
   Serial.printf("POWER   | Bat: %d%% (%0.2fV) \n", currentBatteryPercentage,
                 getBatteryVoltage());
   Serial.printf("STATE   | Charging: %s | USB: %s | BLE: %s | BAT: %s\n",
-                isCharging() ? "YES ⚡" : "NO 🔋",
+                isCharging() ? "YES" : "NO",
                 isPluggedIn() ? "CONNECTED" : "DISCONNECTED",
                 deviceConnected ? "CONNECTED" : "IDLE",
                 batteryConnected ? "PRESENT" : "MISSING");
@@ -850,14 +880,14 @@ void connect_callback(uint16_t conn_handle) {
   lastDisconnectTime = millis();
 
   digitalWrite(OnboardledPin, LOW); // Solid Blue ON when connected
-  Serial.println("✅ Client connected!");
+  Serial.println("Client connected!");
 
   // Bumping TX power back to 0 dBm for a stable, high-range connection
   Bluefruit.setTxPower(0);
 
   Bluefruit.Connection(conn_handle)->requestPHY(); // try 2M, harmless if rejected
   Bluefruit.Connection(conn_handle)->requestMtuExchange(247);
-  Bluefruit.Connection(conn_handle)->requestConnectionParameter(24, 0, 400); // 30ms, 4s sup timeout
+  Bluefruit.Connection(conn_handle)->requestConnectionParameter(24, 0, 600); // 30ms, 6s sup timeout
   delay(400);
   uint16_t mtu = Bluefruit.Connection(conn_handle)->getMtu();
   Serial.printf(">> Negotiated MTU = %u (need >= 91 to fit 88-byte notify)\n", mtu);
@@ -865,19 +895,18 @@ void connect_callback(uint16_t conn_handle) {
 
 void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   deviceConnected = false;
-  lastDisconnectTime = millis(); // Start GPS hot timeout timer immediately
-  lastActivityTime = millis();   // Count disconnection as activity
+  lastDisconnectTime = millis();
+  lastActivityTime = millis();
 
-  // Turn off Blue LED immediately on disconnect
   digitalWrite(OnboardledPin, HIGH);
-  Serial.println("❌ BLE Client disconnected.");
-  Serial.printf("🛰️ GPS staying hot for %d minutes...\n",
+  Serial.println("BLE Client disconnected.");
+  Serial.printf("GPS staying hot for %d minutes...\n",
                 (GPS_HOT_TIMEOUT_MS / 60000));
 }
 
 void write_callback(uint16_t conn_handle, BLECharacteristic *chr, uint8_t *data,
                     uint16_t len) {
-  Serial.print("📨 Received BLE command: ");
+  Serial.print("Received BLE command: ");
   for (int i = 0; i < len; i++)
     Serial.printf("0x%02X ", data[i]);
   Serial.println();
@@ -887,7 +916,7 @@ void setIMUForSleep() {
   IMU.settings.gyroEnabled = 0;
   IMU.settings.accelEnabled = 0;
   IMU.begin();
-  // 52Hz, ±2g
+  // 52Hz, +/-2g
   IMU.writeRegister(LSM6DS3_ACC_GYRO_CTRL1_XL, 0x30);
   // Enable tap detection
   IMU.writeRegister(LSM6DS3_ACC_GYRO_TAP_CFG1, 0x8E);
@@ -904,7 +933,7 @@ void setIMUForSleep() {
 }
 
 void enterDeepSleep() {
-  Serial.println("💤 Entering Deep Sleep (Shake to Wake)...");
+  Serial.println("Entering Deep Sleep (Shake to Wake)...");
   Bluefruit.autoConnLed(false);
 
   // Turn off all LEDs
@@ -915,20 +944,16 @@ void enterDeepSleep() {
   digitalWrite(LED_BLUE, HIGH);
   digitalWrite(LED_RED, HIGH);
 
-  // Ensure GPS is off
   disableGPS();
+  setIMUForSleep();
+  pinMode(PIN_CHG, INPUT_PULLUP_SENSE);
 
-  // Configure Triggers for Wake-up
-  setIMUForSleep(); // Trigger 1: Shake (IMU INT pin)
-  pinMode(PIN_CHG,
-          INPUT_PULLUP_SENSE); // Trigger 2: Plug-in (Charge pin goes LOW)
-
-  delay(100); // Small delay for I2C to finish and IMU to settle
+  delay(100);
   digitalWrite(LED_GREEN, HIGH);
   digitalWrite(LED_BLUE, HIGH);
   digitalWrite(LED_RED, HIGH);
 
-  Serial.flush(); // Ensure serial message is sent before power cut
+  Serial.flush();
   NRF_POWER->SYSTEMOFF = 1;
 }
 
@@ -944,10 +969,10 @@ void setupHardware() {
 
   pinMode(PIN_VBAT, INPUT);
   pinMode(PIN_VBAT_ENABLE, OUTPUT);
-  digitalWrite(PIN_VBAT_ENABLE, LOW); // Start LOW & Stay LOW (Safe & Stable)
+  digitalWrite(PIN_VBAT_ENABLE, LOW);
   pinMode(PIN_HICHG, OUTPUT);
   digitalWrite(PIN_HICHG, LOW);
-  pinMode(PIN_CHG, INPUT_PULLUP); // Prevent float current leakage
+  pinMode(PIN_CHG, INPUT_PULLUP);
 
   Wire.setClock(400000);
   analogReference(AR_DEFAULT);
@@ -1020,17 +1045,17 @@ void setupBLE() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\n🚀 SYSTEM STARTUP");
+  Serial.println("\n\nSYSTEM STARTUP");
 
   setupHardware();
 
-  Serial.println("🔍 Checking power source...");
+  Serial.println("Checking power source...");
   isNoBatteryMode = detectNoBatteryAtBoot();
   if (isNoBatteryMode) {
     batteryConnected = false;
-    Serial.println("⚠️ NO BATTERY DETECTED! Booting in USB Always-On mode.");
+    Serial.println("NO BATTERY DETECTED! Booting in USB Always-On mode.");
   } else {
-    Serial.println("🔋 Battery detected! Booting in standard/Eco mode.");
+    Serial.println("Battery detected! Booting in standard/Eco mode.");
   }
 
   updateBatteryState();
@@ -1050,7 +1075,7 @@ void setup() {
   }
 
   if (IMU.begin() != 0) {
-    Serial.println("❌ IMU Init Failed");
+    Serial.println("IMU Init Failed");
   } else {
     imuEnabled = true;
     if (!isNoBatteryMode)
@@ -1061,13 +1086,13 @@ void setup() {
 
   // Initial Advertising Setup
   if (isNoBatteryMode) {
-    setupAdvertising(0, FAST_ADV_INTERVAL);
+    setupAdvertising(4, FAST_ADV_INTERVAL);
     enableGPS(); // Keep it hot from the start
-    Serial.println("📡 BLE Broadcast Started (FAST - Always On).");
+    Serial.println("BLE Broadcast Started (FAST - Always On).");
   } else {
     setupAdvertising(LOW_POWER_BT_TX_POWER, ECO_ADV_INTERVAL);
     disableGPS();
-    Serial.println("📡 BLE Broadcast Started (ECO).");
+    Serial.println("BLE Broadcast Started (ECO).");
   }
 
   // Initialize Activity Trackers to current time to prevent immediate timeouts
@@ -1090,14 +1115,12 @@ void loop() {
   bool idle = !deviceConnected && !gpsEnabled && !imuEnabled;
 
   if (idle && !isNoBatteryMode) {
-    manageBatterySampling(); // Always track battery to prevent deep sleep death
+    manageBatterySampling();
     if (isPluggedIn()) {
       reportSystemStats();
     }
     managePower();
-    powerDownSensors(); // Enforce shutdown state while in light sleep
-    // Sleep in small chunks so we can wake up instantly when a BLE connection
-    // occurs
+    powerDownSensors();
     for (int i = 0; i < LOOP_SLEEP; i += 100) {
       if (deviceConnected)
         break;
